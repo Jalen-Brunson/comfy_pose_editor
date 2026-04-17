@@ -263,11 +263,35 @@ function createPoseEditorWidget(node) {
             }
         }
 
+        // Lazy per-frame loader: returns an <img> whose src hits the
+        // single-frame endpoint. Same element is reused across redraws so
+        // the browser caches. drawFrame checks .complete, and the image
+        // re-triggers drawFrame via onload once it arrives.
+        function ensureFrame(idx, kind) {
+            const arr = kind === "skeleton" ? skeletonFrames : originalFrames;
+            if (arr[idx]) return arr[idx];
+            const img = new Image();
+            img.onload = () => {
+                if (idx === currentFrame) drawFrame();
+            };
+            img.onerror = () => {
+                console.warn(`PoseEditor: failed to load frame ${idx} (${kind})`);
+            };
+            const params = new URLSearchParams({
+                node_id: String(node.id),
+                kind,
+                idx: String(idx),
+            });
+            img.src = `/pose_editor/get_frame?${params.toString()}`;
+            arr[idx] = img;
+            return img;
+        }
+
         function drawFrame() {
             if (totalFrames === 0) return;
 
-            const origImg = originalFrames[currentFrame];
-            const skelImg = skeletonFrames[currentFrame];
+            const origImg = ensureFrame(currentFrame, "original");
+            const skelImg = ensureFrame(currentFrame, "skeleton");
 
             // Fit canvas to container while maintaining aspect ratio
             const container = canvas.parentElement;
@@ -666,8 +690,11 @@ function createPoseEditorWidget(node) {
 
         // ── Auto-detect joints from skeleton image ──
         function autoDetectJoints() {
-            const skelImg = skeletonFrames[currentFrame];
-            if (!skelImg) return;
+            const skelImg = ensureFrame(currentFrame, "skeleton");
+            if (!skelImg || !skelImg.complete || !skelImg.naturalWidth) {
+                console.warn("PoseEditor: skeleton frame not yet loaded, try again in a moment.");
+                return;
+            }
 
             // Draw skeleton image to a temp canvas and read pixels
             const tmpCanvas = document.createElement("canvas");
@@ -747,7 +774,7 @@ function createPoseEditorWidget(node) {
 
     async function loadImagesFromNode() {
         try {
-            const response = await api.fetchApi("/pose_editor/get_frames", {
+            const response = await api.fetchApi("/pose_editor/get_info", {
                 method: "POST",
                 body: JSON.stringify({ node_id: node.id }),
                 headers: { "Content-Type": "application/json" },
@@ -758,22 +785,9 @@ function createPoseEditorWidget(node) {
                 canvasWidth = data.width;
                 canvasHeight = data.height;
                 totalFrames = data.frame_count;
-
-                // Load frame images
-                const loadImage = (src) => new Promise((resolve) => {
-                    const img = new Image();
-                    img.onload = () => resolve(img);
-                    img.onerror = () => resolve(null);
-                    img.src = src;
-                });
-
-                originalFrames = await Promise.all(
-                    data.original_urls.map(url => loadImage(url))
-                );
-                skeletonFrames = await Promise.all(
-                    data.skeleton_urls.map(url => loadImage(url))
-                );
-                console.log(`PoseEditor: Loaded ${totalFrames} frames (${canvasWidth}x${canvasHeight})`);
+                originalFrames = new Array(totalFrames);
+                skeletonFrames = new Array(totalFrames);
+                console.log(`PoseEditor: ${totalFrames} frames available (${canvasWidth}x${canvasHeight}) — loading on demand`);
             } else {
                 const errData = await response.json().catch(() => ({}));
                 const errMsg = errData.error || `HTTP ${response.status}`;
